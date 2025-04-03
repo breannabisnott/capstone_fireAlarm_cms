@@ -24,6 +24,10 @@ typedef struct sensor_data {
   bool threshold;  //gas thresh
   float sensorValue; // gas conc
   float oxygen_level; // o2 conc
+  float humidity;
+  float lat;
+  float lng;
+  float accuracy;
 } sensor_data;
 
 sensor_data sensorData;
@@ -53,7 +57,7 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
   dataReceived = true;
 }
 
-void post_sensor_data(){
+void post_sensor_data(float latitude, float longitude, float accuracy){
   if (!dataReceived) return;
 
   HTTPClient http;
@@ -68,6 +72,10 @@ void post_sensor_data(){
 
   JsonDocument doc;
 
+  sensorData.lat = latitude;
+  sensorData.lng = longitude;
+  sensorData.accuracy = accuracy;
+
   doc["device_id"] = sensorData.device_id;
   doc["temperature"] = sensorData.temperature;
   doc["flame"] = sensorData.fire_status;
@@ -75,6 +83,19 @@ void post_sensor_data(){
   doc["gas"]  = sensorData.threshold;
   doc["gas_concentration"]  = sensorData.sensorValue;
   doc["oxygen_concentration"] = sensorData.oxygen_level;
+  doc["humidity"] = sensorData.humidity;
+  doc["lat"] = sensorData.lat;
+  doc["lng"] = sensorData.lng;
+  doc["accuracy"] = sensorData.accuracy;
+
+  Serial.println("--------------------------------------");
+  Serial.print("Latitude: ");
+  Serial.println(sensorData.lat, 6);
+  Serial.print("Longitude: ");
+  Serial.println(longitude, 6);
+  Serial.print("Accuracy: ");
+  Serial.println(accuracy);
+  Serial.println("--------------------------------------\n");
 
   doc.shrinkToFit();
 
@@ -175,21 +196,24 @@ void sendRequest(String jsonString) {
       //Serial.println("Response: " + response);
 
       // Parse JSON response
-      JsonDocument doc;
-      DeserializationError error = deserializeJson(doc, response);
+      JsonDocument docloc;
+      DeserializationError error = deserializeJson(docloc, response);
 
       if (!error) {
-          float latitude = doc["location"]["lat"];
-          float longitude = doc["location"]["lng"];
-          float accuracy = doc["accuracy"];
-          Serial.println("--------------------------------------");
-          Serial.print("Latitude: ");
-          Serial.println(latitude, 6);
-          Serial.print("Longitude: ");
-          Serial.println(longitude, 6);
-          Serial.print("Accuracy: ");
-          Serial.println(accuracy);
-          Serial.println("--------------------------------------\n");
+          float latitude = docloc["location"]["lat"];
+          float longitude = docloc["location"]["lng"];
+          float accuracy = docloc["accuracy"];
+
+          post_sensor_data(latitude, longitude, accuracy);
+
+          // Serial.println("--------------------------------------");
+          // Serial.print("Latitude: ");
+          // Serial.println(latitude, 6);
+          // Serial.print("Longitude: ");
+          // Serial.println(longitude, 6);
+          // Serial.print("Accuracy: ");
+          // Serial.println(accuracy);
+          // Serial.println("--------------------------------------\n");
       } else {
           Serial.println("JSON parsing failed!");
       }
@@ -204,12 +228,12 @@ void sendRequest(String jsonString) {
 void loop() {
   scanWiFiNetworks();
 
-  if (WiFi.status() == WL_CONNECTED && dataReceived) {
-    post_sensor_data();
-  } else {
-    Serial.println("Waiting for new sensor data...");
-    delay(2000);
-  }
-  ///////////////////////////////////////////////////////////////
+  // if (WiFi.status() == WL_CONNECTED && dataReceived) {
+  //   scanWiFiNetworks();
+  // } else {
+  //   Serial.println("Waiting for new sensor data...");
+  //   delay(2000);
+  // }
+  //--------------------------------------------------------
 
 }
