@@ -1,9 +1,14 @@
 #include <esp_now.h>
+#include <esp_wifi.h>
 #include <WiFi.h>
 #include <ArduinoJson.h>
 #include "env.h"
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
+#include <LiquidCrystal_I2C.h>
+
+LiquidCrystal_I2C lcd(0x27,20,4);  // set the LCD address to 0x27 for a 16 chars and 2 line display
+
 
 String endpoint = "https://api.fyahalarm.com";
 
@@ -12,7 +17,7 @@ void sendRequest(String jsonString);
 
 const char* Host = "www.googleapis.com";
 String thisPage = "/geolocation/v1/geolocate?key=";
-String key = "AIzaSyArfQH4roSbTQfg1d9qHydtbF1hCvg_A8c";
+String key = "AIzaSyDidYXtk9kzBG_sDo1bVP4U89PblOW6Ocs";
 
 // Structure example to receive data
 // Must match the sender structure
@@ -42,6 +47,8 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
   Serial.println(sensorData.device_id);
   Serial.print("Temperature: ");
   Serial.println(sensorData.temperature);
+  Serial.print("Humidity: ");
+  Serial.println(sensorData.humidity);
   Serial.print("Flame Detection: ");
   Serial.println(sensorData.fire_status);
   Serial.print("Flame Level: ");
@@ -118,6 +125,9 @@ void setup() {
   // Initialize Serial Monitor
   Serial.begin(9600);
 
+  lcd.init();                      // initialize the lcd 
+  lcd.backlight();
+
   // WiFi_SSID and WIFI_PASS should be stored in the env.h
   WiFi.begin(ssid, password);
 
@@ -133,6 +143,10 @@ void setup() {
   
   // Set device as a Wi-Fi Station
   WiFi.mode(WIFI_STA);
+
+  // Set the Wi-Fi channel (1-14, usually 1-11 in most regions)
+  int channel = 6; // Choose a channel with least interference
+  esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
 
   // Init ESP-NOW
   if (esp_now_init() != ESP_OK) {
@@ -227,6 +241,8 @@ void sendRequest(String jsonString) {
 
 void loop() {
   scanWiFiNetworks();
+  lcd.clear();
+  lcd.print("Hello World");
 
   // if (WiFi.status() == WL_CONNECTED && dataReceived) {
   //   scanWiFiNetworks();
@@ -237,3 +253,4 @@ void loop() {
   //--------------------------------------------------------
 
 }
+
