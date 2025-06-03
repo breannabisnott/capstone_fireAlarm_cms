@@ -7,79 +7,120 @@
 #include <WiFiClientSecure.h>
 #include <LiquidCrystal_I2C.h>
 
-LiquidCrystal_I2C lcd(0x27,20,4);  // set the LCD address to 0x27 for a 16 chars and 2 line display
+LiquidCrystal_I2C lcd(0x27,20,4);
 
-const int BUTTON_PIN1 = 32;  // Butt1
-const int BUTTON_PIN2 = 33;  // Butt2
-int displayMode = 0;         // Tracks which data to display
-bool lastButtonState = HIGH;
-
-unsigned long sirenStartTime = 0;
-unsigned long sirenDuration = 3000;  // Duration in milliseconds
-const unsigned long COOLDOWN_PERIOD = 0; // 5 mins before allowing retrigger
-unsigned long lastTriggerTime = 0;
-bool sirenActive = false;
-bool dataUpdated = false;
-
-unsigned long lastPressTime = 0;
+const int BUTTON_PIN1 = 32;
+const int BUTTON_PIN2 = 33;
 const int siren = 27;
 
-String endpoint = "https://api.fyahalarm.com";
+int displayMode = 0;
+bool lastButtonState = HIGH;
 
-void scanWiFiNetworks();
-void sendRequest(String jsonString);
-void fetchDataFromAPI();
-void processDataIfReady();
-void scanWiFiTask(void * parameter);
+// Siren control variables
+unsigned long sirenStartTime = 0;
+unsigned long sirenDuration = 3000;
+unsigned long lastTriggerTime = 0;
+bool sirenActive = false;
+bool sirenSilenced = false;
 
-TaskHandle_t wifiScanTaskHandle = NULL;
-
+// Button variables for debouncing stuff
 volatile bool buttonPressed = false;
+volatile bool silenceButtonPressed = false; 
 unsigned long lastDebounceTime = 0;
-const unsigned long debounceDelay = 200;  // 200 ms debounce
-volatile int pressCount = 0;
+unsigned long lastSilenceDebounceTime = 0; 
+const unsigned long debounceDelay = 200;
 
-void IRAM_ATTR handleButtonInterrupt() {
-  unsigned long currentTime = millis();
-  // Check if enough time has passed since the last press
-  if ((currentTime - lastDebounceTime) > debounceDelay) {
-    buttonPressed = true;
-    lastDebounceTime = currentTime;
-  }
-}
+// Communication modes
+typedef enum {
+  MODE_ESPNOW,
+  MODE_WIFI
+} comm_mode_t;
 
-const char* Host = "www.googleapis.com";
-String thisPage = "/geolocation/v1/geolocate?key=";
-String key = "AIzaSyDidYXtk9kzBG_sDo1bVP4U89PblOW6Ocs";
+comm_mode_t currentMode = MODE_ESPNOW;
+unsigned long lastModeSwitch = 0;
+const unsigned long ESPNOW_DURATION = 10000;  // 10 seconds for ESP-NOW
+const unsigned long WIFI_DURATION = 5000;     // 5 seconds for WiFi operations
 
-// Structure example to receive data
-// Must match the sender structure
 typedef struct sensor_data {
   char device_id[50];
   float temperature;
-  bool fire_status; //digital flame
-  float fire_level; //analog flame
-  bool threshold;  //gas thresh
-  float sensorValue; // gas conc
-  float oxygen_level; // o2 conc
+  bool fire_status;
+  float fire_level;
+  bool threshold;
+  float sensorValue;
+  float oxygen_level;
   float humidity;
   float lat;
   float lng;
   float accuracy;
 } sensor_data;
 
+
 sensor_data sensorData;
-sensor_data latestData;
-volatile bool dataReceived = false;
+sensor_data pendingData[5];  // Buffer for multiple readings
+int pendingDataCount = 0;
+bool hasNewData = false;
 
-unsigned long lastDataFetchTime = 0;
-const unsigned long DATA_FETCH_INTERVAL = 5000; // 5 seconds
 
-unsigned long lastApiUpdate = 0;
-const unsigned long API_UPDATE_INTERVAL = 5000; // Update every 5 seconds
+float latitude = 0.0;
+float longitude = 0.0;
+float accuracy = 0.0;
+bool locationObtained = false;
+
+String endpoint = "https://api.fyahalarm.com";
+const char* Host = "www.googleapis.com";
+String thisPage = "/geolocation/v1/geolocate?key=";
+String key = "AIzaSyDidYXtk9kzBG_sDo1bVP4U89PblOW6Ocs";
+
+// Task handles
+TaskHandle_t communicationTaskHandle = NULL;
+
+void initESPNOW();
+void initWiFi();
+void switchToESPNOW();
+void switchToWiFi();
+void updateLCD();
+void scanWiFiNetworks();
+void sendRequest(String jsonString);
+void post_sensor_data();
+void checkSirenTrigger();
+void communicationTask(void *parameter);
+void silenceSiren();
+
+// interrupt handler for button 1 (display button)
+void IRAM_ATTR handleButtonInterrupt() {
+  unsigned long currentTime = millis();
+  if ((currentTime - lastDebounceTime) > debounceDelay) {
+    buttonPressed = true;
+    lastDebounceTime = currentTime;
+  }
+}
+
+// interrupt handler for button 2 (silence button)
+void IRAM_ATTR handleSilenceButtonInterrupt() {
+  unsigned long currentTime = millis();
+  if ((currentTime - lastSilenceDebounceTime) > debounceDelay) {
+    silenceButtonPressed = true;
+    lastSilenceDebounceTime = currentTime;
+  }
+}
+
+void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
+  // Store data in buffer to prevent blocking
+  if (pendingDataCount < 5) {
+    memcpy(&pendingData[pendingDataCount], incomingData, sizeof(sensor_data));
+    pendingDataCount++;
+    hasNewData = true;
+    
+    Serial.println("Data received via ESP-NOW");
+    Serial.print("Device ID: ");
+    Serial.println(pendingData[pendingDataCount-1].device_id);
+    Serial.print("Temperature: ");
+    Serial.println(pendingData[pendingDataCount-1].temperature);
+  }
+}
 
 void updateLCD() {
-  
   lcd.clear();
 
   switch (displayMode) {
@@ -87,12 +128,11 @@ void updateLCD() {
       lcd.setCursor(0, 0);
       lcd.print("Temp: ");
       lcd.print(sensorData.temperature);
-      Serial.print(latestData.temperature);
       lcd.print("C");
       
       lcd.setCursor(0, 1);
       lcd.print("Humidity: ");
-      lcd.print(latestData.humidity);
+      lcd.print(sensorData.humidity);
       lcd.print("%");
       break;
 
@@ -103,278 +143,245 @@ void updateLCD() {
       
       lcd.setCursor(0, 1);
       lcd.print("O2: ");
-      lcd.print(latestData.oxygen_level);
+      lcd.print(sensorData.oxygen_level);
       lcd.print("%");
       break;
 
     case 2:  // Flame & Gas Threshold
       lcd.setCursor(0, 0);
       lcd.print("Flame: ");
-      lcd.print(latestData.fire_status ? "YES" : "NO");
+      lcd.print(sensorData.fire_status ? "YES" : "NO");
       
       lcd.setCursor(0, 1);
       lcd.print("Gas Thresh: ");
-      lcd.print(latestData.threshold ? "HIGH" : "LOW");
+      lcd.print(sensorData.threshold ? "HIGH" : "LOW");
       break;
 
-    case 3:  // Flame Level
+    case 3:  // Status & Location
       lcd.setCursor(0, 0);
-      lcd.print("Flame Lvl: ");
-      lcd.print(latestData.fire_level);
+      lcd.print("Mode: ");
+      lcd.print(currentMode == MODE_ESPNOW ? "ESP-NOW" : "WiFi");
+      
+      lcd.setCursor(0, 1);
+      if (locationObtained) {
+        lcd.print("Location: OK");
+      } else {
+        lcd.print("Getting location...");
+      }
       break;
 
     default:
-      displayMode = 0;  // Reset to first mode
+      displayMode = 0;
       updateLCD();
       break;
   }
 }
-    
-   
 
-void fetchDataFromAPI() {
-  if ((millis() - lastApiUpdate) < API_UPDATE_INTERVAL) {
+void switchToESPNOW() {
+  if (currentMode == MODE_ESPNOW) return;
+  
+  Serial.println("Switching to ESP-NOW mode");
+  
+  // PROPERLY disconnect WiFi
+  if (WiFi.status() == WL_CONNECTED) {
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    delay(500); //cleanup again
+  }
+  
+  WiFi.mode(WIFI_STA);
+  delay(100);
+  
+  int channel = 6;
+  esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+  
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error initializing ESP-NOW");
     return;
   }
-
-  WiFiClientSecure client;
-  HTTPClient http;
-  client.setInsecure(); // For testing only
-
-  String fullUrl = endpoint + "/latestData/" + "AC:15:18:D7:B0:80";
-  http.begin(client, fullUrl);
-  http.addHeader("Content-Type", "application/json");
-
-  int httpCode = http.GET();
   
-  if (httpCode == HTTP_CODE_OK) {
-    String payload = http.getString();
-    Serial.println(payload);
+  esp_now_register_recv_cb(OnDataRecv);
+  currentMode = MODE_ESPNOW;
+  lastModeSwitch = millis();
+  Serial.println("ESP-NOW mode active");
+}
+
+void switchToWiFi() {
+  if (currentMode == MODE_WIFI) return;
   
-    JsonDocument doc;
-    DeserializationError error = deserializeJson(doc, payload);
-
-    if (!error) {
-      JsonArray arr = doc.as<JsonArray>();  // ✅ Define it here
-
-      if (arr.size() > 0) {
-        JsonObject data = arr[0];
-
-        latestData.temperature = data["temperature"] | 0;
-        latestData.fire_status = data["flame"] | false;
-        latestData.fire_level = data["flame_level"] | 0;
-        latestData.threshold = data["gas"] | false;
-        latestData.sensorValue = data["gas_concentration"] | 0;
-        latestData.oxygen_level = data["oxygen_concentration"] | 0;
-        latestData.humidity = data["humidity"] | 0;
-
-        updateLCD();  // ✅ Immediately update LCD with new values
-      }
-    }else {
-      Serial.print("JSON deserialization failed: ");
-      Serial.println(error.c_str());
-    }
-  }else {
-    Serial.print("HTTP Error: ");
-    Serial.println(httpCode);
-    Serial.println(http.getString());
+  Serial.println("Switching to WiFi mode");
+  
+  // Properly deinitialize ESP-NOW
+  esp_now_unregister_recv_cb();
+  esp_now_deinit();
+  delay(500); // Give time for cleanup to prevent those random characters...
+  
+  // Initialize WiFi
+  WiFi.mode(WIFI_STA);
+  delay(100);
+  
+  WiFi.begin(ssid, password);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
   }
-  http.end();
-  lastApiUpdate = millis();
-}
-
-// callback function that will be executed when data is received
-void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
-  memcpy(&sensorData, incomingData, sizeof(sensorData));
-
-  Serial.print("Device ID: ");
-  Serial.println(sensorData.device_id);
-  Serial.print("Temperature: ");
-  Serial.println(sensorData.temperature);
-  Serial.print("Humidity: ");
-  Serial.println(sensorData.humidity);
-  Serial.print("Flame Detection: ");
-  Serial.println(sensorData.fire_status);
-  Serial.print("Flame Level: ");
-  Serial.println(sensorData.fire_level);
-  Serial.print("Gas Threshold: ");
-  Serial.println(sensorData.threshold);
-  Serial.print("Gas Concentration: ");
-  Serial.println(sensorData.sensorValue);
-  Serial.print("O2 Concentration: ");
-  Serial.println(sensorData.oxygen_level);
-  Serial.println();
-
-  dataReceived = true;
-
-}
-
-
-void post_sensor_data(float latitude, float longitude, float accuracy){
-  if (!dataReceived) return;
-
-  HTTPClient http;
-  String requestBody;
-
-  String newEndpoint;
-  String path = "/data";
-  newEndpoint = endpoint + path;    //change path
-
-  http.begin(newEndpoint);
-  http.addHeader("Content-Type", "application/json");
-
-  JsonDocument doc;
-
-  sensorData.lat = latitude;
-  sensorData.lng = longitude;
-  sensorData.accuracy = accuracy;
-
-  doc["device_id"] = sensorData.device_id;
-  doc["temperature"] = sensorData.temperature;
-  doc["flame"] = sensorData.fire_status;
-  doc["flame_level"]  = sensorData.fire_level;
-  doc["gas"]  = sensorData.threshold;
-  doc["gas_concentration"]  = sensorData.sensorValue;
-  doc["oxygen_concentration"] = sensorData.oxygen_level;
-  doc["humidity"] = sensorData.humidity;
-  doc["lat"] = sensorData.lat;
-  doc["lng"] = sensorData.lng;
-  doc["accuracy"] = sensorData.accuracy;
-
-  Serial.println("--------------------------------------");
-  Serial.print("Latitude: ");
-  Serial.println(sensorData.lat, 6);
-  Serial.print("Longitude: ");
-  Serial.println(longitude, 6);
-  Serial.print("Accuracy: ");
-  Serial.println(accuracy);
-  Serial.println("--------------------------------------\n");
-
-  doc.shrinkToFit();
-
-  serializeJson(doc, requestBody);
-
-  int httpResponseCode = http.POST(requestBody);
-
-  Serial.print("HERE IS THE RESPONSE: ");
-  Serial.println(requestBody);
-  Serial.println(http.getString());
-  Serial.println();
-
-  http.end();
-
-  dataReceived = false;
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi connected");
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
+    currentMode = MODE_WIFI;
+  } else {
+    Serial.println("\nWiFi connection failed - staying in current mode");
+    // Don't switch back to ESP-NOW immediately, let it retry
+  }
+  lastModeSwitch = millis();
 }
 
 void scanWiFiNetworks() {
-    Serial.println("Scanning WiFi...");
-    int n = WiFi.scanNetworks();
-    
-    if (n == 0) {
-        Serial.println("No networks found");
-        return;
-    }
+  Serial.println("Scanning WiFi...");
+  int n = WiFi.scanNetworks();
+  
+  if (n == 0) {
+    Serial.println("No networks found");
+    return;
+  }
 
-    Serial.println(String(n) + " networks found.");
-    
-    String jsonString;
-    jsonString = "{\n\"homeMobileCountryCode\": 234,\n";
-    jsonString += "\"homeMobileNetworkCode\": 27,\n";
-    jsonString += "\"radioType\": \"gsm\",\n";
-    jsonString += "\"carrier\": \"Vodafone\",\n";
-    jsonString += "\"wifiAccessPoints\": [\n";
-    
-    for (int i = 0; i < n; i++) {
-        jsonString += "{\n";
-        jsonString += "\"macAddress\" : \"" + WiFi.BSSIDstr(i) + "\",\n";
-        jsonString += "\"signalStrength\": " + String(WiFi.RSSI(i)) + "\n";
-        jsonString += (i < n - 1) ? "},\n" : "}\n";
-    }
+  String jsonString;
+  jsonString = "{\n\"homeMobileCountryCode\": 234,\n";
+  jsonString += "\"homeMobileNetworkCode\": 27,\n";
+  jsonString += "\"radioType\": \"gsm\",\n";
+  jsonString += "\"carrier\": \"Vodafone\",\n";
+  jsonString += "\"wifiAccessPoints\": [\n";
+  
+  for (int i = 0; i < n; i++) {
+    jsonString += "{\n";
+    jsonString += "\"macAddress\" : \"" + WiFi.BSSIDstr(i) + "\",\n";
+    jsonString += "\"signalStrength\": " + String(WiFi.RSSI(i)) + "\n";
+    jsonString += (i < n - 1) ? "},\n" : "}\n";
+  }
 
-    jsonString += "]\n}";
-    
-    sendRequest(jsonString);
+  jsonString += "]\n}";
+  sendRequest(jsonString);
 }
 
 void sendRequest(String jsonString) {
   HTTPClient http;
   String url = "https://" + String(Host) + thisPage + key;
 
-  Serial.println("Connecting to Google...");
-  http.begin(url);  // Start the HTTP request
-  http.addHeader("Content-Type", "application/json");  // Set the content type
+  Serial.println("Getting device location...");
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
 
-  Serial.println("Sending request...");
-  int httpResponseCode = http.POST(jsonString);  // Send the POST request
+  int httpResponseCode = http.POST(jsonString);
 
   if (httpResponseCode > 0) {
-      Serial.print("HTTP Response code: ");
-      Serial.println(httpResponseCode);
+    String response = http.getString();
+    
+    JsonDocument docloc;
+    DeserializationError error = deserializeJson(docloc, response);
 
-      String response = http.getString();  // Get the response payload
-      //Serial.println("Response: " + response);
-
-      // Parse JSON response
-      JsonDocument docloc;
-      DeserializationError error = deserializeJson(docloc, response);
-
-      if (!error) {
-          float latitude = docloc["location"]["lat"];
-          float longitude = docloc["location"]["lng"];
-          float accuracy = docloc["accuracy"];
-
-          post_sensor_data(latitude, longitude, accuracy);
-
-      } else {
-          Serial.println("JSON parsing failed!");
-      }
+    if (!error) {
+      latitude = docloc["location"]["lat"];
+      longitude = docloc["location"]["lng"];
+      accuracy = docloc["accuracy"];
+      locationObtained = true;
+      
+      Serial.println("Location obtained successfully:");
+      Serial.print("Latitude: ");
+      Serial.println(latitude, 6);
+      Serial.print("Longitude: ");
+      Serial.println(longitude, 6);
+      Serial.print("Accuracy: ");
+      Serial.println(accuracy);
+    } else {
+      Serial.print("JSON parsing failed: ");
+      Serial.println(error.c_str());
+    }
   } else {
-      Serial.print("Error on HTTP request: ");
-      Serial.println(httpResponseCode);
+    Serial.print("Location request failed: ");
+    Serial.println(httpResponseCode);
   }
 
-  http.end();  // Close the connection
+  http.end();
+}
+
+void post_sensor_data() {
+  if (pendingDataCount == 0) return;
+  
+  // Skip posting if location not obtained yet
+  if (!locationObtained) {
+    Serial.println("Location not available yet, skipping data post");
+    return;
+  }
+
+  HTTPClient http;
+  String newEndpoint = endpoint + "/data";
+  
+  http.begin(newEndpoint);
+  http.addHeader("Content-Type", "application/json");
+
+  // process the pending data jsut received
+  for (int i = 0; i < pendingDataCount; i++) {
+    JsonDocument doc;
+    
+    // using the fixed location obtained during setup
+    pendingData[i].lat = latitude;
+    pendingData[i].lng = longitude;
+    pendingData[i].accuracy = accuracy;
+
+    doc["device_id"] = pendingData[i].device_id;
+    doc["temperature"] = pendingData[i].temperature;
+    doc["flame"] = pendingData[i].fire_status;
+    doc["flame_level"] = pendingData[i].fire_level;
+    doc["gas"] = pendingData[i].threshold;
+    doc["gas_concentration"] = pendingData[i].sensorValue;
+    doc["oxygen_concentration"] = pendingData[i].oxygen_level;
+    doc["humidity"] = pendingData[i].humidity;
+    doc["lat"] = pendingData[i].lat;
+    doc["lng"] = pendingData[i].lng;
+    doc["accuracy"] = pendingData[i].accuracy;
+
+    String requestBody;
+    serializeJson(doc, requestBody);
+
+    int httpResponseCode = http.POST(requestBody);
+    
+    if (httpResponseCode == 200) {
+      Serial.println("Data posted successfully");
+      // Update latest sensor data for display
+      memcpy(&sensorData, &pendingData[i], sizeof(sensor_data));
+    } else {
+      Serial.print("Post failed: ");
+      Serial.println(httpResponseCode);
+    }
+    
+    delay(100); // Small delay between posts
+  }
+  
+  pendingDataCount = 0; // Clear buffer
+  hasNewData = false;
+  http.end();
 }
 
 void checkSirenTrigger() {
-  if (lastTriggerTime > 0 && millis() - lastTriggerTime < COOLDOWN_PERIOD && !sirenActive) {
-    return;
-  }
-
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi not connected - skipping siren check");
-    return;
-  }
-
   WiFiClientSecure client;
   HTTPClient http;
-  
-  // Configure SSL (important for HTTPS)
-  client.setInsecure(); // Bypass SSL verification (for testing)
-  // For production, add root CA certificate instead with:
-  // client.setCACert(root_ca);
+  client.setInsecure();
 
-  // Construct the complete URL
   String fullUrl = endpoint + "/siren-triggers/" + "AC:15:18:D7:B0:80";
   
-  // Serial.print("Connecting to: ");
-  // Serial.println(fullUrl);
-
-  // Begin connection with HTTPS client
   http.begin(client, fullUrl);
-  
-  // Add headers if needed (remove if not required)
   http.addHeader("Content-Type", "application/json");
-  // http.addHeader("Authorization", "Bearer your_token"); // If using auth
 
   int httpCode = http.GET();
   
   if (httpCode == HTTP_CODE_OK) {
     String payload = http.getString();
-    Serial.print("API Response: ");
-    Serial.println(payload);
-
-    // Parse JSON response
+    
     JsonDocument doc;
     DeserializationError error = deserializeJson(doc, payload);
     
@@ -383,70 +390,117 @@ void checkSirenTrigger() {
       bool tempTrigger = doc["temp_trigger"] | false;
       bool gasTrigger = doc["gas_trigger"] | false;
 
-      if ((fireTrigger | tempTrigger | gasTrigger) && !sirenActive) {
+      // Only activate siren if it's not already active and not silenced
+      if ((fireTrigger || tempTrigger || gasTrigger) && !sirenActive && !sirenSilenced) {
         sirenStartTime = millis();
         lastTriggerTime = millis();
         sirenActive = true;
+        
         if (fireTrigger) digitalWrite(siren, HIGH);
 
         lcd.clear();
+        delay(50);
         lcd.setCursor(0, 0);
         lcd.print("ALERT!");
         if (fireTrigger) lcd.print(" Siren ON");
-        
+
         lcd.setCursor(0, 1);
-        if (fireTrigger) lcd.print("Fire ");
-        if (tempTrigger) lcd.print("Temp ");
-        if (gasTrigger) lcd.print("Gas ");
+        String triggerMsg = "";
+        if (fireTrigger) triggerMsg += "Fire ";
+        if (tempTrigger) triggerMsg += "Temp ";
+        if (gasTrigger) triggerMsg += "Gas ";
         
-        //Serial.println("Siren ACTIVATED due to:");
+        // Clear the line first, then print
+        lcd.print("                    ");
+        lcd.setCursor(0, 1);
+        lcd.print(triggerMsg);
         
-        if (fireTrigger) Serial.println("- Fire detected");
-        if (tempTrigger) Serial.println("- High temperature");
-        if (gasTrigger) Serial.println("- Gas leak detected");
+        
+        Serial.println("SIREN ACTIVATED!");
       }
-    } else {
-      Serial.print("JSON parse failed: ");
-      Serial.println(error.c_str());
+      
+      // Reset silenced flag if no triggers are active
+      if (!fireTrigger) {
+        sirenSilenced = false;
+      }
     }
-  } else {
-    Serial.print("HTTP Error: ");
-    Serial.println(httpCode);
-    Serial.print("Response: ");
-    Serial.println(http.getString()); // Print error response if available
   }
   
   http.end();
 }
 
-
-void scanWiFiTask(void * parameter) {
-  for (;;) {
-      ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-      scanWiFiNetworks();
-      vTaskDelay(100 / portTICK_PERIOD_MS);
+void silenceSiren() {
+  if (sirenActive) {
+    digitalWrite(siren, LOW);
+    sirenActive = false;
+    sirenSilenced = true;  // Mark as manually silenced
+    
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("SIREN SILENCED");
+    lcd.setCursor(0, 1);
+    lcd.print("by user");
+    
+    Serial.println("Siren manually silenced by user");
+    
+    // Show silenced message for 2 seconds, then return to normal display
+    delay(2000);
+    updateLCD();
   }
 }
 
-void sirenCheckTask(void *parameter) {
+void communicationTask(void *parameter) {
   while (true) {
-    checkSirenTrigger();
-    vTaskDelay(5000 / portTICK_PERIOD_MS); // Check every 5 seconds
+    unsigned long currentTime = millis();
+    
+    if (currentMode == MODE_ESPNOW) {
+      // ESP-NOW mode - listen for sensor data
+      if (currentTime - lastModeSwitch >= ESPNOW_DURATION) {
+        switchToWiFi();
+      }
+    } else if (currentMode == MODE_WIFI) {
+      // wifi mode - for API requests
+      if (WiFi.status() == WL_CONNECTED) {
+        
+        // Get location first if not obtained yet but this shouldn't happen after the inital setup
+        if (!locationObtained) {
+          scanWiFiNetworks();
+        } else {
+          // Post any pending sensor data
+          if (hasNewData) {
+            post_sensor_data();
+            updateLCD(); // Update display with latest data
+          }
+          
+          checkSirenTrigger();
+        }
+      } else {
+        Serial.println("WiFi disconnected in task");
+      }
+      
+      // Switch back to ESP-NOW mode
+      if (currentTime - lastModeSwitch >= WIFI_DURATION) {
+        switchToESPNOW();
+      }
+    }
+    
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
   }
 }
 
 void setup() {
-  // Initialize Serial Monitor
   Serial.begin(9600);
-
-  delay(5000);
-
-  pinMode(BUTTON_PIN2, INPUT_PULLUP);
+  delay(2000);
 
   pinMode(BUTTON_PIN1, INPUT_PULLUP);
+  pinMode(BUTTON_PIN2, INPUT_PULLUP);
+  pinMode(siren, OUTPUT);
+  
+  // interrupts for buttons
   attachInterrupt(digitalPinToInterrupt(BUTTON_PIN1), handleButtonInterrupt, FALLING);
+  attachInterrupt(digitalPinToInterrupt(BUTTON_PIN2), handleSilenceButtonInterrupt, FALLING);
 
-  // Initialize LCD
+  // LCD setup
   lcd.init();
   lcd.backlight();
   lcd.clear();
@@ -454,71 +508,121 @@ void setup() {
   lcd.print("Welcome to");
   lcd.setCursor(3, 1);
   lcd.print("Fyah Alarm");
+  delay(2000);
 
-  pinMode(siren, OUTPUT);
-
-  // WiFi_SSID and WIFI_PASS should be stored in the env.h
+  // Initialize communication and get location
+  Serial.println("Initializing WiFi for location...");
+  
+  // Start with a clean WiFi initialization
+  WiFi.mode(WIFI_OFF);
+  delay(1000);
+  WiFi.mode(WIFI_STA);
+  delay(100);
+  
   WiFi.begin(ssid, password);
-
-  // Connect to wifi
-  Serial.println("Connecting");
-  while(WiFi.status() != WL_CONNECTED) {
+  
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Connecting WiFi...");
+  
+  // wait for wifi
+  int wifiAttempts = 0;
+  while (WiFi.status() != WL_CONNECTED && wifiAttempts < 30) {
     delay(1000);
     Serial.print(".");
-  }
-  Serial.println("");
-  Serial.print("Connected to WiFi network with IP Address: ");
-  Serial.println(WiFi.localIP());
-  
-  // Set device as a Wi-Fi Station
-  WiFi.mode(WIFI_STA);
-
-  // Set the Wi-Fi channel (1-14, usually 1-11 in most regions)
-  int channel = 6; // Choose a channel with least interference
-  esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
-
-  // Init ESP-NOW
-  if (esp_now_init() != ESP_OK) {
-    Serial.println("Error initializing ESP-NOW");
-    return;
+    wifiAttempts++;
   }
   
-  // Once ESPNow is successfully Init, we will register for recv CB to
-  // get recv packer info
-
-  uint8_t mac[6];
-  esp_read_mac(mac, ESP_MAC_WIFI_STA); // Works even without WiFi connection
-
-  esp_now_register_recv_cb(OnDataRecv);
-
-  xTaskCreatePinnedToCore(
-    scanWiFiTask,           // Function to run
-    "WiFiScanTask",         // Name of task
-    8192,                   // Stack size (bytes)
-    NULL,                   // Parameter
-    1,                      // Priority
-    &wifiScanTaskHandle,    // Task handle
-    1                       // Core to run on (usually 1 for networking)
-  );
-  xTaskCreate(sirenCheckTask, "SirenCheckTask", 8000, NULL, 1, NULL);
-
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi connected for setup");
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
+    
+    currentMode = MODE_WIFI;
+    
+    Serial.println("Getting device location...");
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Getting location...");
+    
+    // Get location
+    int locationAttempts = 0;
+    while (!locationObtained && locationAttempts < 3) {
+      scanWiFiNetworks();
+      if (!locationObtained) {
+        delay(2000);
+      }
+      locationAttempts++;
+    }
+    
+    if (locationObtained) {
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Location");
+      lcd.setCursor(0, 1);
+      lcd.print("obtained!");
+      delay(2000);
+    } else {
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Location failed");
+      lcd.setCursor(0, 1);
+      lcd.print("Using default");
+      delay(2000);
+      // Set default location if geolocation fails
+      latitude = 0.0;
+      longitude = 0.0;
+      accuracy = 1000.0;
+      locationObtained = true;
+    }
+  } else {
+    Serial.println("\nWiFi connection failed during setup");
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("WiFi failed");
+    lcd.setCursor(0, 1);
+    lcd.print("Using default loc");
+    delay(2000);
+    
+    // Set default location
+    latitude = 0.0;
+    longitude = 0.0;
+    accuracy = 1000.0;
+    locationObtained = true;
+  }
+  
+  // Now switch to ESP-NOW for normal operation
+  switchToESPNOW();
+  
+  // Create communication task
+  xTaskCreate(communicationTask, "CommunicationTask", 10000, NULL, 1, &communicationTaskHandle);
+  
+  Serial.println("System initialized");
 }
 
 void loop() {
-
+  // display mode button presses (Button 1)
   if (buttonPressed) {
     buttonPressed = false;
-
     displayMode = (displayMode + 1) % 4;
     updateLCD();
-    Serial.println("Button was pressed once.");
+    Serial.println("Display mode changed");
   }
 
+  // silence button presses (Button 2)
+  if (silenceButtonPressed) {
+    silenceButtonPressed = false;
+    silenceSiren();
+    Serial.println("Silence button pressed");
+  }
+
+  // siren timeout (only if not manually silenced)
   if (sirenActive && (millis() - sirenStartTime >= sirenDuration)) {
     digitalWrite(siren, LOW);
     sirenActive = false;
-    Serial.println("Siren deactivated after duration");
+    Serial.println("Siren deactivated by timeout");
+    updateLCD(); // Refresh display
   }
 
+  delay(100);
 }
-
